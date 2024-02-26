@@ -1,0 +1,6 @@
+nevergrad
+numpy
+ray
+seaborn
+tensorboard
+torch
