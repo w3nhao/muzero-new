@@ -27,14 +27,15 @@ class DiagnoseModel:
         self.model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu")) 
         self.model.eval()
 
-    def get_virtual_trajectory_from_obs(self, observation, horizon, plot=True, to_explore=0):
+    def get_virtual_trajectory_from_obs(self, theory, theory_dynamics, horizon, plot=True, to_explore=0):
         """
         MuZero explores a simulation but uses its model instead of using the environment.
         We still do an MCTS at each step.
         """
         trajectory_info = Trajectoryinfo("Virtual trajectory", self.config)
+        theory_mask = numpy.where(theory == 0, False, True)
         root, mcts_info = MCTS(self.config).run(
-            self.model, observation, self.config.action_space, to_explore, True
+            self.model, theory, theory_mask, theory_dynamics, self.config.action_space, to_explore, True
         )
         trajectory_info.store_info(root, mcts_info, None, numpy.NaN)
 
@@ -112,10 +113,13 @@ class DiagnoseModel:
                     trajectory_divergence_index = i
                     real_trajectory_end_reason = f"Virtual trajectory reached an illegal move at timestep {trajectory_divergence_index}."
 
-            observation, reward, done = simulation.step(action)
+            theory, theory_dynamics, reward, done = simulation.step(action)
+            theory_mask = numpy.where(theory == 0, False, True)
             root, mcts_info = MCTS(self.config).run(
                 self.model,
-                observation,
+                theory,
+                theory_mask,
+                theory_dynamics,
                 simulation.legal_actions(),
                 simulation.to_explore(),
                 True,

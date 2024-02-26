@@ -186,7 +186,7 @@ class MuZero:
 
         # Launch workers
         [
-            self_explore_worker.continuous_self_exploration.remote(
+            self_explore_worker.continuous_self_explore.remote(
                 self.shared_storage_worker, self.replay_buffer_worker
             )
             for self_explore_worker in self.self_explore_workers
@@ -215,7 +215,7 @@ class MuZero:
                 self.config,
                 self.config.seed + self.config.num_workers,
             )
-        self.test_worker.continuous_self_exploration. \
+        self.test_worker.continuous_self_explore. \
             remote(self.shared_storage_worker, None, True)
 
         # Write everything in TensorBoard
@@ -529,7 +529,7 @@ if __name__ == "__main__":
                 done = False
                 while not done:
                     action = env.human_to_action()
-                    observation, reward, done = env.step(action)
+                    theory, theory_dynamics, reward, done = env.step(action)
                     print(f"\nAction: {env.action_to_string(action)}\nReward: {reward}")
                     env.render()
             else:

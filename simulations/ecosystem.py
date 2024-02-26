@@ -12,7 +12,7 @@ class MuZeroConfig:
 
         ### Simulation
         self.agents = list(range(1))  # List of agents. You should only edit the length
-        self.observation_shape = (2048, 5)  # Dimensions of the simulation observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
+        self.dynamics_shape = (2048, 5)  # Dimensions of the simulation observation, must be 3D (channel, height, width). For a 1D array, please reshape it to (1, 1, length of array)
         
         
         self.stacked_observations = 0  # Number of previous observations and previous actions to add to the current observation
@@ -90,9 +90,9 @@ class MuZeroConfig:
 
         ### Self-Exploration
         self.num_workers = 1  # Number of simultaneous threads/workers self-exploring to feed the replay buffer
-        self.self_explore_on_gpu = False
+        self.self_explore_on_gpu = True
         self.max_moves = 15  # Maximum number of moves if simulation is not finished before
-        self.num_simulations = 50  # Number of future moves self-simulated
+        self.num_simulations = 256  # Number of future moves self-simulated
         self.discount = 1  # Chronological discount of the reward
         self.temperature_threshold = None  # Number of moves before dropping the temperature given by visit_softmax_temperature_fn to 0 (ie selecting the best action). If None, visit_softmax_temperature_fn is used every time
 
@@ -156,7 +156,7 @@ class MuZeroConfig:
 
         # Reanalyze (See paper appendix Reanalyse)
         self.use_last_model_value = True  # Use the last model to provide a fresher, stable n-step value (See paper appendix Reanalyze)
-        self.reanalyse_on_gpu = False
+        self.reanalyse_on_gpu = True
 
 
 
@@ -242,12 +242,6 @@ def generate_sample_idxs(n, total_steps, interval="equal"):
     return idxs.tolist()
 
 
-@dataclass  
-class SampledDynamics:
-    times: np.ndarray
-    dynamics: np.ndarray
-
-
 class EnvArchive:
     """ 'Abstract' class for environment trajectory archive. """
     def __init__(self, config, times: np.ndarray, dynamics: np.ndarray):
@@ -257,7 +251,7 @@ class EnvArchive:
 
     def sample(self, n_samples, sample_interval_type="equal"):
         sample_idxs = generate_sample_idxs(n_samples, len(self.times), sample_interval_type) # fmt: skip
-        return SampledDynamics(self.times[sample_idxs], self.dynamics[sample_idxs])
+        return self.times[sample_idxs], self.dynamics[sample_idxs]
 
     @property
     def tmax(self):
@@ -692,7 +686,6 @@ class Simulation:
         
         gt_init_state = self.env.ecosys_graph.extract_init_state()
         self.gt_observation = self.env.run(self.config.tmax, gt_init_state)
-        self.sampled_gt_observation = self.gt_observation.sample(config.n_samples)
         
         self.action_table = ActionTable(self.env.max_species, num_relations=1)
         # TODO: simple workaround for now to drop setting properties for species
@@ -702,6 +695,7 @@ class Simulation:
         self.hypothesis_actions = []
         [self.action_table.record_action(action) for action in self.premises_actions]
 
+        # NOTE: cache the last theory dynamics in full length
         self._cached_last_theory_dynamics = None
         
         # seed is for the parameter fitting
@@ -715,34 +709,42 @@ class Simulation:
 
         Returns:
             The new observation, the reward and a boolean if the simulation has ended.
+            [theory with padding, theory based environment dynamics]
         """
-        # if there is any intermediate reward, it should be returned here
-        done = self.action_table.is_stop.get(action, False)
+        def generate_observation(theory_based_observation):
+            theory_actions = self.premises_actions + self.hypothesis_actions
+            _, theory_dynamics = theory_based_observation.sample(self.config.n_samples)
+            max_len, theory_len = self.config.max_theory_length, len(theory_actions)
+            theory = np.zeros(max_len, dtype=np.int64)
+            theory[:theory_len] = theory_actions
+            return theory, theory_dynamics
         
+        done = self.action_table.is_stop.get(action, False)
         self.env.update_hypothesis(self.action_table.get_command(action))
         self.hypothesis_actions.append(action)
+
         theory_init_state = self.env.theory_graph.extract_init_state()
-        theory_observation = self.env.run(self.config.tmax, theory_init_state)
-            
-        if np.isnan(theory_observation.dynamics).any():
+        theory_based_observation = self.env.run(self.config.tmax, theory_init_state)
+
+        # Handle NaN in dynamics
+        if np.isnan(theory_based_observation.dynamics).any():
             reward, done = -10, True
-            # if the simulation fails, we should return the last observation
-            # suggesting the last action is illegal
-            theory_observation.dynamics = self._cached_last_theory_dynamics
-            
-        sampled_theory_observation = theory_observation.sample(self.config.n_samples)
-        theory_actions = self.premises_actions + self.hypothesis_actions
-        observation = TheoryDynamicsPair(theory_actions, sampled_theory_observation)
+            theory_based_observation.dynamics = self._cached_last_theory_dynamics
+            theory, theory_dynamics = generate_observation(theory_based_observation)
+            return theory, theory_dynamics, reward, done
+
+        theory, theory_dynamics = generate_observation(theory_based_observation)
         
         self.action_table.record_action(action)
+        # 1 / (1 + sqrt(mean((gt_dyn - theory_dyn) ** 2) / n_samples)
+        if done: reward = 1 / (1 + np.sqrt(np.mean((self.gt_observation.dynamics - theory_based_observation.dynamics) ** 2) / self.config.n_samples))
+        else: reward = 0
         
-        if done:
-            # 1 / (1 - sqrt((x - x')^2/n))
-            reward = 1 / (1 + np.sqrt(np.mean((self.gt_observation.dynamics - theory_observation.dynamics) ** 2) / self.config.n_samples))
-        else:
-            reward = 0
-        return observation, reward, done
-        
+        # NOTE: cache the last theory dynamics in full length
+        self._cached_last_theory_dynamics = theory_based_observation.dynamics
+
+        return theory, theory_dynamics, reward, done
+    
     def to_explore(self):
         """
         Return the current agent id.
@@ -766,41 +768,43 @@ class Simulation:
         """
         # Return the index of True values in the legal_actions array
         # 0 is reserved for the padding action sequence
-        return self.action_table.get_legal_actions()
+        return self.action_table.get_legal_actions().tolist()
 
     def reset(self):
         """
         Reset the simulation for a new simulation.
 
         Returns:
-            Initial observation of the simulation.
+            Initial observation of the simulation. [theory with padding, theory based environment dynamics]
         """
         if self.config.random_env_hidden:
             # self.env = Ecosystem(self.config.dt, self.config.env_cmds, self.config.hidden_cmds, self.config.integrator)
             pass
         else:
             self.env.reset_hypothesis()
-            
+
         self.action_table = ActionTable(self.env.max_species, num_relations=1)
-        
+
         # TODO: simple workaround for now to drop setting properties for species
         self.premises_actions = [self.command_to_action(cmd, self.env.theory_graph) 
-                                 for cmd in self.env.premise_cmds 
-                                 if not cmd.startswith(MOD_OBJ)]
-        self.hypothesis_actions = [] # reset the hypothesis actions
-        [self.action_table.record_action(action) for action in self.premises_actions]
-        
-        
+                                for cmd in self.env.premise_cmds if not cmd.startswith(MOD_OBJ)]
+        self.hypothesis_actions = []
+
+        for action in self.premises_actions:
+            self.action_table.record_action(action)
+
         theory_init_state = self.env.theory_graph.extract_init_state()
-        theory_observation = self.env.run(self.config.tmax, theory_init_state)
-        sampled_theory_observation = theory_observation.sample(self.config.n_samples)
+        theory_based_observation = self.env.run(self.config.tmax, theory_init_state)
+        _, theory_dynamics = theory_based_observation.sample(self.config.n_samples)
         
-        observation = TheoryDynamicsPair(self.premises_actions, sampled_theory_observation)
-        
-        self._cached_last_theory_dynamics = observation.dynamics
-        
-        # obaservation: [premise_actions, sampled_theory_observation]
-        return observation
+        # NOTE: cache the last theory dynamics in full length
+        self._cached_last_theory_dynamics = theory_based_observation.dynamics
+
+        max_len, theory_len = self.config.max_theory_length, len(self.premises_actions)
+        theory = np.zeros(max_len, dtype=np.int64)
+        theory[:theory_len] = self.premises_actions
+
+        return theory, theory_dynamics
 
     def render(self):
         """
@@ -906,8 +910,7 @@ if __name__ == "__main__":
     print(sim.action_to_command(52))
     from matplotlib import pyplot as plt
 
-    traj = sim.gt_observation.sample(config.n_samples)
-    populations = traj.dynamics
+    _, populations = sim.gt_observation.sample(config.n_samples)
 
     plt.figure(figsize=(10, 6))
     rabbit_idx, wolf_idx, eagle_idx, marmot_idx, fox_idx = 0, 1, 2, 3, 4

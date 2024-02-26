@@ -7,7 +7,6 @@ import torch
 
 import models
 
-
 @ray.remote
 class SelfExploration:
     """
@@ -113,9 +112,10 @@ class SelfExploration:
         Perform one simulation with actions based on the Monte Carlo tree search at each moves.
         """
         simulation_history = SimulationHistory()
-        observation = self.simulation.reset()
+        theory, theory_dynamics = self.simulation.reset()
         simulation_history.action_history.append(0)
-        simulation_history.observation_history.append(observation)
+        simulation_history.theory_history.append(theory)
+        simulation_history.dynamics_history.append(theory_dynamics)
         simulation_history.reward_history.append(0)
         simulation_history.to_explore_history.append(self.simulation.to_explore())
 
@@ -128,16 +128,13 @@ class SelfExploration:
             while (
                 not done and len(simulation_history.action_history) <= self.config.max_moves
             ):
-                # assert (
-                #     len(numpy.array(observation.dynamics).shape) == 3
-                # ), f"Observation should be 3 dimensionnal instead of {len(numpy.array(observation.dynamics).shape)} dimensionnal. Got observation of shape: {numpy.array(observation.dynamics).shape}"
-                # HACK: spceial case for theory-based dynamics
                 assert (
-                    numpy.array(observation.dynamics).shape == self.config.observation_shape
-                ), f"Observation should match the observation_shape defined in MuZeroConfig. Expected {self.config.observation_shape} but got {numpy.array(observation.dynamics).shape}."
+                    numpy.array(theory_dynamics).shape == self.config.dynamics_shape
+                ), f"Observation should match the dynamics_shape defined in MuZeroConfig. Expected {self.config.dynamics_shape} but got {numpy.array(theory_dynamics).shape}."
                 
-                
-                stacked_observations = simulation_history.get_stacked_observations(
+
+                # HACK: workaround for the theory-based dynamics, actually no stacking
+                theory, theory_mask, theory_dynamics = simulation_history.preprocess_observations(
                     -1, self.config.stacked_observations, len(self.config.action_space)
                 )
 
@@ -145,7 +142,9 @@ class SelfExploration:
                 if opponent == "self" or muzero_agent == self.simulation.to_explore():
                     root, mcts_info = MCTS(self.config).run(
                         self.model,
-                        stacked_observations,
+                        theory,
+                        theory_mask,
+                        theory_dynamics,
                         self.simulation.legal_actions(),
                         self.simulation.to_explore(),
                         True,
@@ -165,10 +164,10 @@ class SelfExploration:
                         )
                 else:
                     action, root = self.select_opponent_action(
-                        opponent, stacked_observations
+                        opponent, theory, theory_mask, theory_dynamics
                     )
 
-                observation, reward, done = self.simulation.step(action)
+                theory, theory_dynamics, reward, done = self.simulation.step(action)
 
                 if render:
                     print(f"Performed action: {self.simulation.action_to_string(action)}")
@@ -178,7 +177,8 @@ class SelfExploration:
 
                 # Next batch
                 simulation_history.action_history.append(action)
-                simulation_history.observation_history.append(observation)
+                simulation_history.theory_history.append(theory)
+                simulation_history.dynamics_history.append(theory_dynamics)
                 simulation_history.reward_history.append(reward)
                 simulation_history.to_explore_history.append(self.simulation.to_explore())
 
@@ -187,14 +187,16 @@ class SelfExploration:
     def close_simulation(self):
         self.simulation.close()
 
-    def select_opponent_action(self, opponent, stacked_observations):
+    def select_opponent_action(self, opponent, theory, theory_mask, theory_dynamics):
         """
         Select opponent action for evaluating MuZero level.
         """
         if opponent == "human":
             root, mcts_info = MCTS(self.config).run(
                 self.model,
-                stacked_observations,
+                theory,
+                theory_mask,
+                theory_dynamics,
                 self.simulation.legal_actions(),
                 self.simulation.to_explore(),
                 True,
@@ -262,7 +264,9 @@ class MCTS:
     def run(
         self,
         model,
-        observation,
+        theory,
+        theory_mask,
+        theory_dynamics,
         legal_actions,
         to_explore,
         add_exploration_noise,
@@ -279,28 +283,32 @@ class MCTS:
             root_predicted_value = None
         else:
             root = Node(0)
-            observation = (
-                torch.tensor(observation)
-                .float()
-                .unsqueeze(0)
-                .to(next(model.parameters()).device)
-            )
+            
+            
+            theory = torch.tensor(theory, dtype=torch.int).unsqueeze(0).to(next(model.parameters()).device)
+            theory_mask = torch.tensor(theory_mask, dtype=torch.bool).unsqueeze(0).to(next(model.parameters()).device)
+            theory_dynamics = torch.tensor(theory_dynamics, dtype=torch.float).unsqueeze(0).to(next(model.parameters()).device)
+            
             (
                 root_predicted_value,
                 reward,
                 policy_logits,
                 hidden_state,
-            ) = model.initial_inference(observation)
+            ) = model.initial_inference(theory, theory_mask, theory_dynamics)
+            
             root_predicted_value = models.support_to_scalar(
                 root_predicted_value, self.config.support_size
             ).item()
             reward = models.support_to_scalar(reward, self.config.support_size).item()
+            
             assert (
                 legal_actions
             ), f"Legal actions should not be an empty array. Got {legal_actions}."
+            
             assert set(legal_actions).issubset(
                 set(self.config.action_space)
             ), "Legal actions should be a subset of the action space."
+            
             root.expand(
                 legal_actions,
                 to_explore,
@@ -487,7 +495,8 @@ class SimulationHistory:
     """
 
     def __init__(self):
-        self.observation_history = []
+        self.theory_history = []
+        self.dynamics_history = []
         self.action_history = []
         self.reward_history = []
         self.to_explore_history = []
@@ -517,19 +526,25 @@ class SimulationHistory:
 
     # HACK: This is a temporary solution to store the theory and theory-based dynamics
     # The original one: https://github.com/werner-duvaud/muzero-general/blob/master/self_play.py#L513
-    def get_stacked_observations(self, index, num_stacked_observations, action_space_size):
-        index = index % len(self.observation_history)
+    def preprocess_observations(self, index, num_stacked_observations, action_space_size):
+        index = index % len(self.theory_history)
         
         # actually we never stack the observations, just use the last one here
         _, _ = num_stacked_observations, action_space_size # unused
         
-        observation = self.observation_history[index]
+        theory = self.theory_history[index]
+        theory_dynamics = self.dynamics_history[index]
+        
+        # boolean mask for the theory
+        theory_mask = numpy.where(theory == 0, False, True)
         
         # the original method return a numpy array [i, j, k]
         # here we return TheoryDynamicsPair
         # theory: torch.Tensor [max_theory_length, action_space]
         # dynamics: torch.Tensor [n_evo_steps, max_num_objs, num_features]
-        return observation
+        
+        # TODO: mask the theory here
+        return theory, theory_mask, theory_dynamics
 
 class MinMaxStats:
     """

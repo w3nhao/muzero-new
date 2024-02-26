@@ -47,7 +47,7 @@ if __name__ == "__main__":
     sequence_length = 128
     vocabulary_size = 20
     
-    current_path = "/data/wenhao/projects/20230126_muzero-general/models/"
+    current_path = "results/"
     
     num_samples = 100000
     train_samples = int(num_samples * 0.9)

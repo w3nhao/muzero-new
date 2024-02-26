@@ -95,4 +95,6 @@ dmypy.json
 # results
 results/
 deprecated/
+models/
+notebooks/
 ```

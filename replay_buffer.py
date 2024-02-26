@@ -70,13 +70,15 @@ class ReplayBuffer:
     def get_batch(self):
         (
             index_batch,
-            observation_batch,
+            theory_batch,
+            theory_mask_batch,
+            theory_dynamics_batch,
             action_batch,
             reward_batch,
             value_batch,
             policy_batch,
             gradient_scale_batch,
-        ) = ([], [], [], [], [], [], [])
+        ) = ([], [], [], [], [], [], [], [], [])
         weight_batch = [] if self.config.PER else None
 
         for simulation_id, simulation_history, simulation_prob in self.sample_n_simulations(
@@ -89,13 +91,15 @@ class ReplayBuffer:
             )
 
             index_batch.append([simulation_id, simulation_pos])
-            observation_batch.append(
-                simulation_history.get_stacked_observations(
+            theory, theory_mask, theory_dynamics = simulation_history.\
+                preprocess_observations(
                     simulation_pos,
                     self.config.stacked_observations,
                     len(self.config.action_space),
                 )
-            )
+            theory_batch.append(theory)
+            theory_mask_batch.append(theory_mask)
+            theory_dynamics_batch.append(theory_dynamics)
             action_batch.append(actions)
             value_batch.append(values)
             reward_batch.append(rewards)
@@ -117,7 +121,6 @@ class ReplayBuffer:
                 weight_batch
             )
 
-        # observation_batch: batch, channels, height, width
         # action_batch: batch, num_unroll_steps+1
         # value_batch: batch, num_unroll_steps+1
         # reward_batch: batch, num_unroll_steps+1
@@ -127,7 +130,9 @@ class ReplayBuffer:
         return (
             index_batch,
             (
-                observation_batch,
+                theory_batch,
+                theory_mask_batch,
+                theory_dynamics_batch,
                 action_batch,
                 value_batch,
                 reward_batch,
@@ -342,26 +347,23 @@ class Reanalyse:
 
             # Use the last model to provide a fresher, stable n-step value (See paper appendix Reanalyze)
             if self.config.use_last_model_value:
-                # TODO: Now the observation is not like the original one
-                raise NotImplementedError
-                observations = numpy.array(
-                    [
-                        simulation_history.get_stacked_observations(
-                            i,
-                            self.config.stacked_observations,
-                            len(self.config.action_space),
-                        )
-                        for i in range(len(simulation_history.root_values))
-                    ]
-                )
+                theory, theory_mask, theory_dynamics = [], [], []
+                for i in range(len(simulation_history.root_values)):
+                    _theory, _theory_mask, _theory_dynamics = simulation_history.preprocess_observations(
+                        i,
+                        self.config.stacked_observations,
+                        len(self.config.action_space),
+                    )
+                    theory.append(_theory)
+                    theory_mask.append(_theory_mask)
+                    theory_dynamics.append(_theory_dynamics)
 
-                observations = (
-                    torch.tensor(observations)
-                    .float()
-                    .to(next(self.model.parameters()).device)
-                )
+                
+                theory = torch.tensor(numpy.array(theory), dtype=torch.int).to(next(self.model.parameters()).device)
+                theory_mask = torch.tensor(numpy.array(theory_mask), dtype=torch.bool).to(next(self.model.parameters()).device)
+                theory_dynamics = torch.tensor(numpy.array(theory_dynamics)).float().to(next(self.model.parameters()).device)
                 values = models.support_to_scalar(
-                    self.model.initial_inference(observations)[0],
+                    self.model.initial_inference(theory, theory_mask, theory_dynamics)[0],
                     self.config.support_size,
                 )
                 simulation_history.reanalysed_predicted_root_values = (

@@ -121,7 +121,9 @@ class Trainer:
         """
 
         (
-            observation_batch,
+            theory_batch,
+            theory_mask_batch,
+            theory_dynamics_batch,
             action_batch,
             target_value,
             target_reward,
@@ -137,15 +139,14 @@ class Trainer:
         device = next(self.model.parameters()).device
         if self.config.PER:
             weight_batch = torch.tensor(weight_batch.copy()).float().to(device)
-        observation_batch = (
-            torch.tensor(numpy.array(observation_batch)).float().to(device)
-        )
+        theory_batch = (torch.tensor(numpy.array(theory_batch), dtype=torch.int).to(device))
+        theory_mask_batch = (torch.tensor(numpy.array(theory_mask_batch)).bool().to(device))
+        theory_dynamics_batch = (torch.tensor(numpy.array(theory_dynamics_batch)).float().to(device))
         action_batch = torch.tensor(action_batch).long().to(device).unsqueeze(-1)
         target_value = torch.tensor(target_value).float().to(device)
         target_reward = torch.tensor(target_reward).float().to(device)
         target_policy = torch.tensor(target_policy).float().to(device)
         gradient_scale_batch = torch.tensor(gradient_scale_batch).float().to(device)
-        # observation_batch: batch, channels, height, width
         # action_batch: batch, num_unroll_steps+1, 1 (unsqueeze)
         # target_value: batch, num_unroll_steps+1
         # target_reward: batch, num_unroll_steps+1
@@ -158,7 +159,7 @@ class Trainer:
         # target_reward: batch, num_unroll_steps+1, 2*support_size+1
 
         ## Generate predictions
-        value, reward, policy_logits, hidden_state = self.model.initial_inference(observation_batch)
+        value, reward, policy_logits, hidden_state = self.model.initial_inference(theory_batch, theory_mask_batch, theory_dynamics_batch)
         predictions = [(value, reward, policy_logits)]
         for i in range(1, action_batch.shape[1]):
             value, reward, policy_logits, hidden_state = self.model.recurrent_inference(hidden_state, action_batch[:, i])

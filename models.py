@@ -8,7 +8,7 @@ class MuZeroNetwork:
     def __new__(cls, config):
         if config.network == "SimpleNet":
             return SimpleNetwork(
-                observation_shape=config.observation_shape,
+                dynamics_shape=config.dynamics_shape,
                 stacked_observations=config.stacked_observations,
                 action_space_size=len(config.action_space),
                 encoding_size=config.encoding_size,
@@ -76,7 +76,7 @@ class ConvEncoderWithGN(nn.Module):
         self.conv1 = nn.Conv1d(in_channels=in_channels, out_channels=out_channels // 2, 
                                kernel_size=3, stride=1, padding=1)
         self.gn1 = nn.GroupNorm(num_groups=8, num_channels=out_channels // 2)
-        self.relu = nn.ReLU()
+        self.elu = nn.ELU()
         
         # Second convolution for further processing
         self.conv2 = nn.Conv1d(in_channels=out_channels // 2, out_channels=out_channels, 
@@ -87,8 +87,8 @@ class ConvEncoderWithGN(nn.Module):
         self.adaptive_pool = nn.AdaptiveAvgPool1d(out_len)
 
     def forward(self, x):
-        x = self.relu(self.gn1(self.conv1(x)))
-        x = self.relu(self.gn2(self.conv2(x)))
+        x = self.elu(self.gn1(self.conv1(x)))
+        x = self.elu(self.gn2(self.conv2(x)))
         x = self.adaptive_pool(x)  # Resize feature maps to the desired output length
         return x
 
@@ -97,7 +97,7 @@ class ConvEncoderWithGN(nn.Module):
 class SimpleRepresentationNetwork(torch.nn.Module):
     def __init__(
         self,
-        observation_shape,
+        dynamics_shape,
         action_space_size,
         encoding_size,
         max_theory_length,
@@ -136,7 +136,7 @@ class SimpleRepresentationNetwork(torch.nn.Module):
         )
 
         self.dynamics_embedder = ConvEncoderWithGN(
-            in_channels=observation_shape[0],
+            in_channels=dynamics_shape[0],
             out_channels=32,
             out_len=dynamics_encode_length,
         )
@@ -149,8 +149,8 @@ class SimpleRepresentationNetwork(torch.nn.Module):
             
         
     def forward(self, theory, mask, dynamics):
-        theory_encoded = self.theory_encoder(theory, mask=mask)
-        dynamics_encoded = self.dynamics_encoder(self.dynamics_embedder(dynamics))
+        theory_encoded = self.theory_encoder(theory, return_embeddings=True, mask=mask)
+        dynamics_encoded = self.dynamics_encoder(self.dynamics_embedder(dynamics).permute(0, 2, 1))
         # mean pooling over length dimension
         dynamics_encoded = dynamics_encoded.mean(dim=1)
         # theory should be mean pooled over length dimension but mask should be applied
@@ -166,7 +166,7 @@ class AbstractNetwork(ABC, torch.nn.Module):
         pass
 
     @abstractmethod
-    def initial_inference(self, observation):
+    def initial_inference(self, theory, theory_dynamics):
         pass
 
     @abstractmethod
@@ -182,7 +182,7 @@ class AbstractNetwork(ABC, torch.nn.Module):
 class SimpleNetwork(AbstractNetwork):
     def __init__(
         self,
-        observation_shape,
+        dynamics_shape,
         stacked_observations,
         action_space_size,
         encoding_size,
@@ -203,7 +203,7 @@ class SimpleNetwork(AbstractNetwork):
         
         self.representation_network = torch.nn.DataParallel(
             SimpleRepresentationNetwork(
-                observation_shape=observation_shape,
+                dynamics_shape=dynamics_shape,
                 action_space_size=action_space_size,
                 encoding_size=encoding_size,
                 max_theory_length=max_theory_length,
@@ -237,9 +237,9 @@ class SimpleNetwork(AbstractNetwork):
         value = self.prediction_value_network(encoded_state)
         return policy_logits, value
 
-    def representation(self, observation):
+    def representation(self, theory, theory_mask, theory_dynamics):
         encoded_state = self.representation_network(
-            observation.view(observation.shape[0], -1)
+            theory=theory, mask=theory_mask, dynamics=theory_dynamics
         )
         # Scale encoded state between [0, 1] (See appendix paper Training)
         min_encoded_state = encoded_state.min(1, keepdim=True)[0]
@@ -276,16 +276,16 @@ class SimpleNetwork(AbstractNetwork):
 
         return next_encoded_state_normalized, reward
 
-    def initial_inference(self, observation):
-        encoded_state = self.representation(observation)
+    def initial_inference(self, theory, theory_mask, theory_dynamics):
+        encoded_state = self.representation(theory, theory_mask, theory_dynamics)
         policy_logits, value = self.prediction(encoded_state)
         # reward equal to 0 for consistency
         reward = torch.log(
             (
                 torch.zeros(1, self.full_support_size)
                 .scatter(1, torch.tensor([[self.full_support_size // 2]]).long(), 1.0)
-                .repeat(len(observation), 1)
-                .to(observation.device)
+                .repeat(len(encoded_state), 1)
+                .to(encoded_state.device)
             )
         )
 
@@ -295,8 +295,6 @@ class SimpleNetwork(AbstractNetwork):
         next_encoded_state, reward = self.dynamics(encoded_state, action)
         policy_logits, value = self.prediction(next_encoded_state)
         return value, reward, policy_logits, next_encoded_state
-
-
 
 
 def support_to_scalar(logits, support_size):
